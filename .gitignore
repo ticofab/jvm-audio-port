@@ -1,0 +1,7 @@
+# Clones of the code we studied (each is its own git repo)
+sources/
+
+# Build outputs
+target/
+.idea/
+.DS_Store
