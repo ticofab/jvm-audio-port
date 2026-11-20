@@ -49,6 +49,11 @@ final class Ops {
         && BACKEND.gatedResidual(x, g, scale, batch, channels, len);
   }
 
+  /** The accelerator's device API, or null when there is none. */
+  static io.github.ticofab.demucs.spi.Device device() {
+    return BACKEND == null ? null : BACKEND.device();
+  }
+
   static void constant(float[] array) {
     if (BACKEND != null) BACKEND.constant(array);
   }

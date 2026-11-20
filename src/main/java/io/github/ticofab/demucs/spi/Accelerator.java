@@ -54,6 +54,11 @@ public interface Accelerator {
     return false;
   }
 
+  /** Device-resident buffers and queued operations, if this accelerator offers them; null otherwise. */
+  default Device device() {
+    return null;
+  }
+
   /** Elementwise work smaller than this many elements stays on the CPU. */
   default int minElements() {
     return 1 << 20;

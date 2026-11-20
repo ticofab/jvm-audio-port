@@ -53,11 +53,19 @@ hardware is present; `-Ddemucs.backend=java` forces the CPU path.
 | Backend | Artifact | Hardware | Demucs segment time (M1 Max) |
 |---------|----------|----------|----------------------:|
 | `java` (built in) | `demucs-jvm` | any CPU | 3.9 s (BS-Roformer: 35 s per 9.3 s chunk) |
-| `metal` | `demucs-jvm-metal` | Apple GPU (Metal Performance Shaders) | 1.1 s (BS-Roformer: 5.1 s) |
+| `metal` | `demucs-jvm-metal` | Apple GPU (Metal Performance Shaders) | 1.2 s (BS-Roformer: 2.4 s) |
 
 `demucs-jvm-metal` is pure Java too: it calls Metal through the FFM API and the Objective-C runtime, so nothing
 native is shipped. Run with `--enable-native-access=ALL-UNNAMED` (or the module name) to silence the JDK's
 native-access warning. Its output matches PyTorch as closely as the CPU path (121 dB on the bass segment).
+
+Backends can also offer `spi.Device`: buffers that stay on the accelerator and operations queued in one submission.
+BS-Roformer uses it to run its whole transformer stack on the GPU.
+
+## Crossover
+
+`Crossover.blend(low, high, hz, sampleRate, order)` takes the lows of one stem and the highs of another, split by a
+zero-phase Butterworth lowpass that matches scipy's `butter` + `sosfiltfilt` (256.8 dB SNR against it).
 
 ## Scope
 

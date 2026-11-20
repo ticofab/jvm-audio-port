@@ -7,6 +7,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.IntStream;
+import io.github.ticofab.demucs.spi.Device;
 
 /**
  * BS-Roformer (band-split RoPE transformer) inference, for checkpoints like BS-Roformer-SW as run by
@@ -106,11 +107,16 @@ public final class BSRoformer {
     }
 
     // Axial transformer: along time within each band, then along bands within each frame.
-    for (int l = 0; l < layers; l++) {
-      transformer(x, tokens, "layers." + l + ".0", bands, frames, 1, bands); // sequence = band, position = frame
-      transformer(x, tokens, "layers." + l + ".1", frames, bands, bands, 1); // sequence = frame, position = band
+    Device dev = Ops.device();
+    if (dev != null) {
+      transformersOnDevice(dev, x, frames, bands);
+    } else {
+      for (int l = 0; l < layers; l++) {
+        transformer(x, tokens, "layers." + l + ".0", bands, frames, 1, bands); // sequence = band, position = frame
+        transformer(x, tokens, "layers." + l + ".1", frames, bands, bands, 1); // sequence = frame, position = band
+      }
+      rmsNorm(x, tokens, DIM, p("final_norm.gamma"));
     }
-    rmsNorm(x, tokens, DIM, p("final_norm.gamma"));
 
     // Mask head: per band, Linear -> tanh -> Linear -> GLU, giving the band's (bin, channel, re/im) mask values.
     float[] mask = new float[frames * features];
@@ -150,6 +156,63 @@ public final class BSRoformer {
       out[ch] = stft.inverse(masked, HOP * (frames - 1));
     });
     return out;
+  }
+
+  /**
+   * The whole transformer stack and the final norm on the accelerator: x goes up once and comes back once, and every
+   * operation in between is queued on the device.
+   */
+  private void transformersOnDevice(Device dev, float[] x, int frames, int bands) {
+    int tokens = frames * bands, inner = HEADS * HEAD_DIM;
+    Device.Buffer bx = dev.upload(x), xn = dev.allocate((long) tokens * DIM);
+    Device.Buffer qkv = dev.allocate((long) tokens * 3 * inner), gates = dev.allocate((long) tokens * HEADS);
+    Device.Buffer q = dev.allocate((long) tokens * inner), k = dev.allocate((long) tokens * inner);
+    Device.Buffer v = dev.allocate((long) tokens * inner), ctx = dev.allocate((long) tokens * inner);
+    Device.Buffer merged = dev.allocate((long) tokens * inner), hidden = dev.allocate((long) tokens * FF);
+    Map<String, Device.Buffer[]> tables = new HashMap<>();
+    List<Device.Buffer> scratch = new ArrayList<>(List.of(bx, xn, qkv, gates, q, k, v, ctx, merged, hidden));
+    for (int l = 0; l < layers; l++) {
+      for (int axis = 0; axis < 2; axis++) {
+        String name = "layers." + l + "." + axis, a = name + ".layers.0.0", ff = name + ".layers.0.1";
+        boolean time = axis == 0;
+        int sequences = time ? bands : frames, length = time ? frames : bands;
+        int seqStride = time ? 1 : bands, posStride = time ? bands : 1;
+        Device.Buffer[] cs = tables.computeIfAbsent(length + ":" + a, key -> ropeTables(dev, p(a + ".rotary_embed.freqs"), length, scratch));
+        // Attention, residual.
+        dev.rmsNorm(bx, xn, tokens, DIM, dev.constant(p(a + ".norm.gamma")));
+        dev.gemm(tokens, 3 * inner, DIM, xn, DIM, dev.constant(p(a + ".to_qkv.weight")), 3 * inner, qkv, 3 * inner, false);
+        dev.ropeSplit(qkv, q, k, v, sequences, length, seqStride, posStride, HEADS, HEAD_DIM, cs[0], cs[1]);
+        dev.attention(sequences, length, HEADS, HEAD_DIM, q, k, v, ctx);
+        dev.gemm(tokens, HEADS, DIM, xn, DIM, dev.constant(p(a + ".to_gates.weight")), HEADS, gates, HEADS, false);
+        dev.gateMerge(ctx, gates, dev.constant(p(a + ".to_gates.bias")), merged, sequences, length, seqStride, posStride,
+            HEADS, HEAD_DIM);
+        dev.gemm(tokens, DIM, inner, merged, inner, dev.constant(p(a + ".to_out.0.weight")), DIM, bx, DIM, true);
+        // Feed-forward, residual.
+        dev.rmsNorm(bx, xn, tokens, DIM, dev.constant(p(ff + ".net.0.gamma")));
+        dev.gemm(tokens, FF, DIM, xn, DIM, dev.constant(p(ff + ".net.1.weight")), FF, hidden, FF, false);
+        dev.addBias(hidden, dev.constant(p(ff + ".net.1.bias")), tokens, FF, true);
+        dev.gemm(tokens, DIM, FF, hidden, FF, dev.constant(p(ff + ".net.4.weight")), DIM, bx, DIM, true);
+        dev.addBias(bx, dev.constant(p(ff + ".net.4.bias")), tokens, DIM, false);
+      }
+    }
+    dev.rmsNorm(bx, xn, tokens, DIM, dev.constant(p("final_norm.gamma")));
+    dev.download(xn, x, tokens * DIM);
+    scratch.forEach(dev::release);
+  }
+
+  // cos and sin of position * freqs[pair], in float32 as torch computes the angles; uploaded as (length, pairs).
+  private static Device.Buffer[] ropeTables(Device dev, float[] freqs, int length, List<Device.Buffer> scratch) {
+    int pairs = HEAD_DIM / 2;
+    float[] cos = new float[length * pairs], sin = new float[length * pairs];
+    for (int i = 0; i < length; i++)
+      for (int j = 0; j < pairs; j++) {
+        float angle = i * freqs[j];
+        cos[i * pairs + j] = (float) Math.cos(angle);
+        sin[i * pairs + j] = (float) Math.sin(angle);
+      }
+    Device.Buffer[] t = {dev.upload(cos), dev.upload(sin)};
+    scratch.addAll(List.of(t));
+    return t;
   }
 
   /**
