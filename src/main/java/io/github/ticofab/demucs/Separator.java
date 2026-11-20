@@ -29,6 +29,13 @@ public final class Separator {
     this.random = random;
   }
 
+  /** One source of this separator as a {@link StemSeparator}, e.g. {@code stem("bass")}. */
+  public StemSeparator stem(String source) {
+    int index = sources().indexOf(source);
+    if (index < 0) throw new IllegalArgumentException("unknown source " + source + "; have " + sources());
+    return (mix, progress) -> separate(mix, progress)[index];
+  }
+
   /** The model's source names, in the order {@link #separate} returns them. */
   public List<String> sources() {
     return model.sources();

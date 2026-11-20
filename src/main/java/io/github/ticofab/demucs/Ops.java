@@ -37,6 +37,12 @@ final class Ops {
     return BACKEND != null && BACKEND.attention(nq, nk, heads, headDim, q, k, v, out);
   }
 
+  /** {@link io.github.ticofab.demucs.spi.Accelerator#batchedAttention} on the accelerator, if it takes it. */
+  static boolean batchedAttention(int batch, int length, int heads, int headDim, float[] q, float[] k, float[] v,
+                                  float[] out) {
+    return BACKEND != null && BACKEND.batchedAttention(batch, length, heads, headDim, q, k, v, out);
+  }
+
   /** {@link io.github.ticofab.demucs.spi.Accelerator#gatedResidual} on the accelerator, if it takes it. */
   static boolean gatedResidual(float[] x, float[] g, float[] scale, int batch, int channels, int len) {
     return BACKEND != null && x.length >= BACKEND.minElements()
@@ -74,6 +80,12 @@ final class Ops {
       int j0 = (task % colTiles) * COL_TILE, j1 = Math.min(n, j0 + COL_TILE);
       gemmTile(i0, i1, j0, j1, k, a, aOff, lda, b, bOff, ldb, c, cOff, ldc, accumulate);
     });
+  }
+
+  /** {@link #gemm} on the calling thread only, for callers that parallelize over many small products. */
+  static void gemmSerial(int m, int n, int k, float[] a, int aOff, int lda, float[] b, int bOff, int ldb,
+                         float[] c, int cOff, int ldc) {
+    gemmTile(0, m, 0, n, k, a, aOff, lda, b, bOff, ldb, c, cOff, ldc, false);
   }
 
   // One tile of C. The k loop is unrolled by 4 so each pass over a row of C does four multiply-adds per load and

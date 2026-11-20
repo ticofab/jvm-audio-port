@@ -65,11 +65,16 @@ public final class TorchCheckpoint {
 
   /** All tensors found under {@code path} (a dict of name to tensor, e.g. {@code "state"}), widened to fp32. */
   public Map<String, Tensor> tensors(String... path) throws IOException {
+    return tensors(name -> true, path);
+  }
+
+  /** Like {@link #tensors(String...)}, loading only the tensors whose name passes {@code keep}. */
+  public Map<String, Tensor> tensors(java.util.function.Predicate<String> keep, String... path) throws IOException {
     Object node = root;
     for (String key : path) node = ((Map<?, ?>) node).get(key);
     Map<String, Tensor> out = new LinkedHashMap<>();
     for (Map.Entry<?, ?> e : ((Map<?, ?>) node).entrySet()) {
-      if (e.getValue() instanceof TensorRef ref) out.put((String) e.getKey(), load(ref));
+      if (e.getValue() instanceof TensorRef ref && keep.test((String) e.getKey())) out.put((String) e.getKey(), load(ref));
     }
     return out;
   }

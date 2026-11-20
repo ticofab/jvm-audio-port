@@ -7,19 +7,19 @@ import java.util.concurrent.SubmissionPublisher;
 import java.util.function.DoubleConsumer;
 
 /**
- * A {@link Flow.Processor} that separates one source (e.g. bass) out of a stereo stream.
+ * A {@link Flow.Processor} that separates one stem (e.g. bass) out of a stereo stream, with any
+ * {@link StemSeparator} (Demucs via {@link Separator#stem}, or {@link RoformerSeparator}).
  *
  * <p>Input elements are interleaved stereo frames ({@code L0, R0, L1, R1, ...}) at 44.1 kHz, in chunks of any size;
  * output elements are the separated source in the same format, in chunks of {@code outputChunkFrames}.
  *
- * <p>Demucs normalizes by statistics of the whole song, so this processor collects the full input before separating;
+ * <p>Both models normalize by statistics of the whole song, so this processor collects the full input before separating;
  * output starts once the input completes. Separation runs on {@code executor}, never on the caller's thread, and
  * output respects downstream demand.
  */
 public final class SeparationProcessor implements Flow.Processor<float[], float[]> {
 
-  private final Separator separator;
-  private final int sourceIndex;
+  private final StemSeparator separator;
   private final int outputChunkFrames;
   private final Executor executor;
   private final DoubleConsumer progress;
@@ -29,15 +29,10 @@ public final class SeparationProcessor implements Flow.Processor<float[], float[
   private float[] buffer = new float[1 << 20];
   private int size;
 
-  /**
-   * @param source name of the source to emit, one of {@link Separator#sources()}
-   * @param progress receives the separation's completed fraction, from {@code executor}'s thread
-   */
-  public SeparationProcessor(Separator separator, String source, int outputChunkFrames, Executor executor,
+  /** @param progress receives the separation's completed fraction, from {@code executor}'s thread */
+  public SeparationProcessor(StemSeparator separator, int outputChunkFrames, Executor executor,
                              DoubleConsumer progress) {
     this.separator = separator;
-    this.sourceIndex = separator.sources().indexOf(source);
-    if (sourceIndex < 0) throw new IllegalArgumentException("unknown source " + source + "; have " + separator.sources());
     this.outputChunkFrames = outputChunkFrames;
     this.executor = executor;
     this.progress = progress;
@@ -90,7 +85,7 @@ public final class SeparationProcessor implements Flow.Processor<float[], float[
           mix[0][i] = input[2 * i];
           mix[1][i] = input[2 * i + 1];
         }
-        float[][] source = separator.separate(mix, progress)[sourceIndex];
+        float[][] source = separator.separate(mix, progress);
         for (int start = 0; start < n; start += outputChunkFrames) {
           int len = Math.min(outputChunkFrames, n - start);
           float[] chunk = new float[2 * len];

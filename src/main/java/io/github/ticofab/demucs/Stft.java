@@ -7,7 +7,7 @@ import java.util.stream.IntStream;
  * giving the (frequency × time) picture the spectrogram branch works on; the inverse puts frames back together.
  *
  * <p>STFT/iSTFT matching {@code torch.stft}/{@code torch.istft} with a periodic Hann window, {@code center=True},
- * reflect padding and {@code normalized=True}, for a power-of-two {@code nfft} and hop {@code nfft/4}.
+ * reflect padding, and {@code normalized} either way, for a power-of-two {@code nfft}.
  */
 final class Stft {
 
@@ -17,8 +17,15 @@ final class Stft {
   private final double[] cos;
   private final double[] sin;
   private final int[] bitReverse;
+  private final boolean normalized;
 
+  /** {@code normalized=true} as in Demucs. */
   Stft(int nfft, int hop) {
+    this(nfft, hop, true);
+  }
+
+  Stft(int nfft, int hop, boolean normalized) {
+    this.normalized = normalized;
     if (Integer.bitCount(nfft) != 1) throw new IllegalArgumentException("nfft must be a power of two: " + nfft);
     this.nfft = nfft;
     this.hop = hop;
@@ -52,7 +59,7 @@ final class Stft {
     float[] x = reflectPad(signal, 0, signal.length, nfft / 2, nfft / 2);
     int frames = 1 + (x.length - nfft) / hop;
     int bins = nfft / 2 + 1;
-    float scale = (float) (1 / Math.sqrt(nfft));
+    float scale = normalized ? (float) (1 / Math.sqrt(nfft)) : 1f;
     float[][] out = new float[frames][];
     IntStream.range(0, frames).parallel().forEach(f -> {
       double[] re = new double[nfft], im = new double[nfft];
@@ -77,7 +84,7 @@ final class Stft {
     int bins = nfft / 2 + 1;
     int full = nfft + hop * (frames - 1);
     float[][] chunks = new float[frames][];
-    double scale = Math.sqrt(nfft) / nfft; // undo normalized=True, then the 1/N of the inverse DFT
+    double scale = (normalized ? Math.sqrt(nfft) : 1) / nfft; // undo the normalization, then the inverse DFT's 1/N
     IntStream.range(0, frames).parallel().forEach(f -> {
       double[] re = new double[nfft], im = new double[nfft];
       float[] z = spec[f];

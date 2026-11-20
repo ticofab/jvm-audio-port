@@ -45,6 +45,15 @@ public interface Accelerator {
     return false;
   }
 
+  /**
+   * Attention over {@code batch} independent sequences of {@code length} tokens each: inputs and output are
+   * {@code (batch, length, heads*headDim)}; {@code q} is not yet scaled. Returns false if unsupported.
+   */
+  default boolean batchedAttention(int batch, int length, int heads, int headDim, float[] q, float[] k, float[] v,
+                                   float[] out) {
+    return false;
+  }
+
   /** Elementwise work smaller than this many elements stays on the CPU. */
   default int minElements() {
     return 1 << 20;
