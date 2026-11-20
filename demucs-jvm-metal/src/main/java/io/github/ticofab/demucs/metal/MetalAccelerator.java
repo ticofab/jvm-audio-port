@@ -173,7 +173,23 @@ public final class MetalAccelerator implements Accelerator {
         uint sr = (sg / 2) * 16, sc = (sg % 2) * 16; // this SIMD group's 16×16 quarter of the tile
         simdgroup_float8x8 acc[2][2];
         for (uint i = 0; i < 2; i++) for (uint j = 0; j < 2; j++) acc[i][j] = simdgroup_float8x8(0);
-        for (uint k0 = 0; k0 < g.K; k0 += T) {
+        bool interior = row0 + T <= g.M && col0 + T <= g.N && g.K % 8 == 0;
+        if (interior) {
+          // Fully inside the matrices: each SIMD group loads its fragments straight from memory.
+          device const float* ar = a + (ulong) (row0 + sr) * g.lda;
+          for (uint k0 = 0; k0 < g.K; k0 += 8) {
+            simdgroup_float8x8 fa[2], fb[2];
+            for (uint i = 0; i < 2; i++) simdgroup_load(fa[i], ar + (ulong) (8 * i) * g.lda + k0, g.lda);
+            for (uint j = 0; j < 2; j++) {
+              uint cj = col0 + sc + 8 * j;
+              if (g.transB) simdgroup_load(fb[j], b + (ulong) cj * g.ldb + k0, g.ldb, ulong2(0, 0), true);
+              else simdgroup_load(fb[j], b + (ulong) k0 * g.ldb + cj, g.ldb);
+            }
+            for (uint i = 0; i < 2; i++)
+              for (uint j = 0; j < 2; j++) simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);
+          }
+        }
+        for (uint k0 = 0; !interior && k0 < g.K; k0 += T) {
           for (uint e = tid; e < T * T; e += 128) {
             uint r = e / T, kk = e % T, gr = row0 + r, gk = k0 + kk;
             As[e] = gr < g.M && gk < g.K ? a[(ulong) gr * g.lda + gk] : 0.0f;

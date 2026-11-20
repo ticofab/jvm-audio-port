@@ -53,7 +53,7 @@ hardware is present; `-Ddemucs.backend=java` forces the CPU path.
 | Backend | Artifact | Hardware | Demucs segment time (M1 Max) |
 |---------|----------|----------|----------------------:|
 | `java` (built in) | `demucs-jvm` | any CPU | 3.9 s (BS-Roformer: 35 s per 9.3 s chunk) |
-| `metal` | `demucs-jvm-metal` | Apple GPU (Metal, kernels of its own) | 1.2 s (BS-Roformer: 3.2 s) |
+| `metal` | `demucs-jvm-metal` | Apple GPU (Metal, kernels of its own) | 1.2 s (BS-Roformer: 2.5 s) |
 
 `demucs-jvm-metal` is pure Java too: it calls Metal through the FFM API and the Objective-C runtime, so nothing
 native is shipped. Run with `--enable-native-access=ALL-UNNAMED` (or the module name) to silence the JDK's
