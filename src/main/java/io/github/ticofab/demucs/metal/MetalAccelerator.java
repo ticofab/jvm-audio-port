@@ -19,7 +19,8 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
 /**
  * The Apple GPU through Metal Performance Shaders: matrix multiplies ({@code MPSMatrixMultiplication}) and whole
- * attention blocks (plus {@code MPSMatrixSoftMax}), using shared (unified) memory. Weights marked
+ * attention blocks (with a softmax kernel of our own: MPS's was most of attention's time), using shared (unified)
+ * memory. Weights marked
  * {@link #constant constant} are uploaded once and stay on the GPU.
  */
 public final class MetalAccelerator implements Accelerator {
@@ -66,6 +67,100 @@ public final class MetalAccelerator implements Accelerator {
         uint go = b * 2 * per;
         x[i] += scale[c] * g[go + r] * sigmoid(g[go + per + r]);
       }
+
+      // Sum (or max) over a threadgroup: within each SIMD group, then across them through threadgroup memory.
+      static float group_reduce(float v, bool is_max, threadgroup float* shared, uint lane, uint simd, uint groups) {
+        v = is_max ? simd_max(v) : simd_sum(v);
+        if (lane == 0) shared[simd] = v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd == 0) {
+          float w = lane < groups ? shared[lane] : (is_max ? -INFINITY : 0.0f);
+          w = is_max ? simd_max(w) : simd_sum(w);
+          if (lane == 0) shared[0] = w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float r = shared[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        return r;
+      }
+
+      // One threadgroup per row; dims: rows, dim.
+      kernel void rms_norm(device const float* x [[buffer(0)]], device float* out [[buffer(1)]],
+                           device const float* gamma [[buffer(2)]], constant uint* dims [[buffer(3)]],
+                           uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                           uint tpg [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                           uint simd [[simdgroup_index_in_threadgroup]]) {
+        threadgroup float shared[32];
+        uint dim = dims[1];
+        device const float* xr = x + (ulong) row * dim;
+        float sq = 0.0f;
+        for (uint d = tid; d < dim; d += tpg) sq += xr[d] * xr[d];
+        sq = group_reduce(sq, false, shared, lane, simd, (tpg + 31) / 32);
+        float f = sqrt((float) dim) / max(sqrt(sq), 1e-12f);
+        device float* o = out + (ulong) row * dim;
+        for (uint d = tid; d < dim; d += tpg) o[d] = xr[d] * f * gamma[d];
+      }
+
+      // In-place softmax of each row, one threadgroup per row; dims: cols.
+      kernel void softmax_rows(device float* x [[buffer(0)]], constant uint* dims [[buffer(1)]],
+                               uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+                               uint tpg [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                               uint simd [[simdgroup_index_in_threadgroup]]) {
+        threadgroup float shared[32];
+        uint cols = dims[0], groups = (tpg + 31) / 32;
+        device float* r = x + (ulong) row * cols;
+        float m = -INFINITY;
+        for (uint j = tid; j < cols; j += tpg) m = max(m, r[j]);
+        m = group_reduce(m, true, shared, lane, simd, groups);
+        float sum = 0.0f;
+        for (uint j = tid; j < cols; j += tpg) {
+          float e = precise::exp(r[j] - m);
+          r[j] = e;
+          sum += e;
+        }
+        float inv = 1.0f / group_reduce(sum, false, shared, lane, simd, groups);
+        for (uint j = tid; j < cols; j += tpg) r[j] *= inv;
+      }
+
+      // dims: sequences, length, seqStride, posStride, heads, headDim
+      kernel void rope_split(device const float* qkv [[buffer(0)]], device float* q [[buffer(1)]],
+                             device float* k [[buffer(2)]], device float* v [[buffer(3)]],
+                             device const float* cosT [[buffer(4)]], device const float* sinT [[buffer(5)]],
+                             constant uint* dims [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
+        uint length = dims[1], seqStride = dims[2], posStride = dims[3], headDim = dims[5];
+        uint inner = dims[4] * headDim;
+        if (gid >= dims[0] * length * inner) return;
+        uint n = gid / inner, c = gid % inner, s = n / length, i = n % length;
+        device const float* src = qkv + (ulong) (s * seqStride + i * posStride) * 3 * inner;
+        uint d = c % headDim, pairs = headDim / 2, t = i * pairs + d / 2;
+        float cs = cosT[t], sn = sinT[t];
+        bool even = (d & 1) == 0;
+        uint a = even ? c : c - 1;
+        float qa = src[a], qb = src[a + 1], ka = src[inner + a], kb = src[inner + a + 1];
+        q[gid] = even ? qa * cs - qb * sn : qb * cs + qa * sn;
+        k[gid] = even ? ka * cs - kb * sn : kb * cs + ka * sn;
+        v[gid] = src[2 * inner + c];
+      }
+
+      // dims: sequences, length, seqStride, posStride, heads, headDim
+      kernel void gate_merge(device const float* ctx [[buffer(0)]], device const float* gates [[buffer(1)]],
+                             device const float* gateBias [[buffer(2)]], device float* out [[buffer(3)]],
+                             constant uint* dims [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+        uint length = dims[1], seqStride = dims[2], posStride = dims[3], heads = dims[4], headDim = dims[5];
+        uint inner = heads * headDim;
+        if (gid >= dims[0] * length * inner) return;
+        uint n = gid / inner, c = gid % inner, s = n / length, i = n % length;
+        uint tok = s * seqStride + i * posStride, h = c / headDim;
+        out[(ulong) tok * inner + c] = ctx[gid] * sigmoid(gates[tok * heads + h] + gateBias[h]);
+      }
+
+      // dims: rows, cols, gelu
+      kernel void add_bias(device float* x [[buffer(0)]], device const float* bias [[buffer(1)]],
+                           constant uint* dims [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+        if (gid >= dims[0] * dims[1]) return;
+        float v = x[gid] + bias[gid % dims[1]];
+        x[gid] = dims[2] != 0 ? 0.5f * v * (1.0f + erf_nr(v * 0.70710678118654752f)) : v;
+      }
       """;
 
   private static final java.lang.foreign.MemoryLayout MTL_SIZE =
@@ -73,7 +168,8 @@ public final class MetalAccelerator implements Accelerator {
 
   private MemorySegment device = MemorySegment.NULL;
   private MemorySegment queue;
-  private MemorySegment geluPipeline, gluPipeline, gatedPipeline;
+  private MemorySegment geluPipeline, gluPipeline, gatedPipeline, rmsPipeline, ropePipeline, gatePipeline, biasPipeline,
+      softmaxPipeline;
   private final Map<float[], MemorySegment> constants = new IdentityHashMap<>();
   // Temporary buffers are recycled by power-of-two size: allocating (and zeroing) large buffers on every call costs
   // more than the work on small layers.
@@ -182,6 +278,11 @@ public final class MetalAccelerator implements Accelerator {
         geluPipeline = pipeline(library, "gelu");
         gluPipeline = pipeline(library, "glu");
         gatedPipeline = pipeline(library, "gated_residual");
+        rmsPipeline = pipeline(library, "rms_norm");
+        ropePipeline = pipeline(library, "rope_split");
+        gatePipeline = pipeline(library, "gate_merge");
+        biasPipeline = pipeline(library, "add_bias");
+        softmaxPipeline = pipeline(library, "softmax_rows");
       } finally {
         ObjC.poolPop(pool);
       }
@@ -264,13 +365,9 @@ public final class MetalAccelerator implements Accelerator {
       MemorySegment bv = keep(temps, upload(v, 0, nk * dim, (long) (nk + 1) * dim));
       MemorySegment bo = keep(temps, output((long) (nq + 1) * dim * 4));
       MemorySegment scores = keep(temps, output((long) nq * nk * 4));
-      MemorySegment probs = keep(temps, output((long) nq * nk * 4));
       MemorySegment qk = keep(owned, multiplication(false, true, nq, nk, headDim));
       MemorySegment pv = keep(owned, multiplication(false, false, nq, headDim, nk));
-      MemorySegment softmax = keep(owned, (MemorySegment) ObjC.send(ADDRESS,
-          ObjC.id(ObjC.cls("MPSMatrixSoftMax"), "alloc"), "initWithDevice:", List.of(ADDRESS), device));
       MemorySegment matS = keep(owned, matrix(scores, 0, nq, nk, nk));
-      MemorySegment matP = keep(owned, matrix(probs, 0, nq, nk, nk));
       MemorySegment commands = ObjC.id(queue, "commandBuffer");
       List<java.lang.foreign.MemoryLayout> four = List.of(ADDRESS, ADDRESS, ADDRESS, ADDRESS);
       for (int h = 0; h < heads; h++) {
@@ -280,9 +377,8 @@ public final class MetalAccelerator implements Accelerator {
         MemorySegment matV = keep(owned, matrix(bv, off, nk, headDim, dim));
         MemorySegment matO = keep(owned, matrix(bo, off, nq, headDim, dim));
         ObjC.send(null, qk, "encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:", four, commands, matQ, matK, matS);
-        ObjC.send(null, softmax, "encodeToCommandBuffer:inputMatrix:resultMatrix:", List.of(ADDRESS, ADDRESS, ADDRESS),
-            commands, matS, matP);
-        ObjC.send(null, pv, "encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:", four, commands, matP, matV, matO);
+        encodeSoftmax(commands, scores, nq, nk);
+        ObjC.send(null, pv, "encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:", four, commands, matS, matV, matO);
       }
       run(commands);
       copyOut(contents(bo, (long) nq * dim), 0, out, 0, nq * dim);
@@ -338,6 +434,11 @@ public final class MetalAccelerator implements Accelerator {
   // One compute kernel over n threads: buffers at indices 0.., then the ints as one small constant buffer.
   private void dispatch(MemorySegment pipeline, int n, MemorySegment[] buffers, int[] ints) {
     MemorySegment commands = ObjC.id(queue, "commandBuffer");
+    encodeKernel(commands, pipeline, n, buffers, ints);
+    run(commands);
+  }
+
+  private void encodeKernel(MemorySegment commands, MemorySegment pipeline, int n, MemorySegment[] buffers, int[] ints) {
     MemorySegment encoder = ObjC.id(commands, "computeCommandEncoder");
     ObjC.send(null, encoder, "setComputePipelineState:", List.of(ADDRESS), pipeline);
     for (int i = 0; i < buffers.length; i++) {
@@ -358,7 +459,37 @@ public final class MetalAccelerator implements Accelerator {
       ObjC.send(null, encoder, "dispatchThreads:threadsPerThreadgroup:", List.of(MTL_SIZE, MTL_SIZE), grid, group);
     }
     ObjC.call(encoder, "endEncoding");
-    run(commands);
+  }
+
+  // One threadgroup of up to 256 threads per row, for the row-reduction kernels.
+  private void encodeRows(MemorySegment commands, MemorySegment pipeline, int rows, int threads, MemorySegment[] buffers,
+                          int[] ints) {
+    MemorySegment encoder = ObjC.id(commands, "computeCommandEncoder");
+    ObjC.send(null, encoder, "setComputePipelineState:", List.of(ADDRESS), pipeline);
+    for (int i = 0; i < buffers.length; i++) {
+      ObjC.send(null, encoder, "setBuffer:offset:atIndex:", List.of(ADDRESS, JAVA_LONG, JAVA_LONG), buffers[i], 0L, (long) i);
+    }
+    try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+      MemorySegment args = arena.allocateFrom(JAVA_INT, ints);
+      ObjC.send(null, encoder, "setBytes:length:atIndex:", List.of(ADDRESS, JAVA_LONG, JAVA_LONG), args,
+          (long) ints.length * 4, (long) buffers.length);
+      long width = Math.min(Math.min(256, threads),
+          (long) ObjC.send(JAVA_LONG, pipeline, "maxTotalThreadsPerThreadgroup", List.of()));
+      width = Math.max(32, (width + 31) / 32 * 32);
+      MemorySegment grid = arena.allocate(MTL_SIZE), group = arena.allocate(MTL_SIZE);
+      grid.setAtIndex(JAVA_LONG, 0, rows);
+      grid.setAtIndex(JAVA_LONG, 1, 1);
+      grid.setAtIndex(JAVA_LONG, 2, 1);
+      group.setAtIndex(JAVA_LONG, 0, width);
+      group.setAtIndex(JAVA_LONG, 1, 1);
+      group.setAtIndex(JAVA_LONG, 2, 1);
+      ObjC.send(null, encoder, "dispatchThreadgroups:threadsPerThreadgroup:", List.of(MTL_SIZE, MTL_SIZE), grid, group);
+    }
+    ObjC.call(encoder, "endEncoding");
+  }
+
+  private void encodeSoftmax(MemorySegment commands, MemorySegment scores, int rows, int cols) {
+    encodeRows(commands, softmaxPipeline, rows, cols, new MemorySegment[] {scores}, new int[] {cols});
   }
 
   private MemorySegment pipeline(MemorySegment library, String function) {
@@ -396,14 +527,11 @@ public final class MetalAccelerator implements Accelerator {
       MemorySegment bq = keep(temps, upload(q, 0, n, padded)), bk = keep(temps, upload(k, 0, n, padded));
       MemorySegment bv = keep(temps, upload(v, 0, n, padded));
       MemorySegment bo = keep(temps, output(padded * 4));
-      MemorySegment scores = keep(temps, output(scoreBytes)), probs = keep(temps, output(scoreBytes));
+      MemorySegment scores = keep(temps, output(scoreBytes));
       MemorySegment qk = keep(owned, multiplication(false, true, length, length, headDim, 1 / Math.sqrt(headDim)));
       MemorySegment pv = keep(owned, multiplication(false, false, length, headDim, length, 1.0));
-      MemorySegment softmax = keep(owned, (MemorySegment) ObjC.send(ADDRESS,
-          ObjC.id(ObjC.cls("MPSMatrixSoftMax"), "alloc"), "initWithDevice:", List.of(ADDRESS), device));
       long seqBytes = (long) length * inner * 4;
       MemorySegment matS = keep(owned, batchMatrix(scores, 0, length, length, length * 4L, (long) length * length * 4, batch));
-      MemorySegment matP = keep(owned, batchMatrix(probs, 0, length, length, length * 4L, (long) length * length * 4, batch));
       MemorySegment commands = ObjC.id(queue, "commandBuffer");
       List<java.lang.foreign.MemoryLayout> four = List.of(ADDRESS, ADDRESS, ADDRESS, ADDRESS);
       for (int h = 0; h < heads; h++) {
@@ -413,9 +541,8 @@ public final class MetalAccelerator implements Accelerator {
         MemorySegment matV = keep(owned, batchMatrix(bv, off, length, headDim, inner * 4L, seqBytes, batch));
         MemorySegment matO = keep(owned, batchMatrix(bo, off, length, headDim, inner * 4L, seqBytes, batch));
         ObjC.send(null, qk, "encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:", four, commands, matQ, matK, matS);
-        ObjC.send(null, softmax, "encodeToCommandBuffer:inputMatrix:resultMatrix:", List.of(ADDRESS, ADDRESS, ADDRESS),
-            commands, matS, matP);
-        ObjC.send(null, pv, "encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:", four, commands, matP, matV, matO);
+        encodeSoftmax(commands, scores, batch * length, length);
+        ObjC.send(null, pv, "encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:", four, commands, matS, matV, matO);
       }
       run(commands);
       copyOut(contents(bo, n), 0, out, 0, n);
@@ -547,5 +674,177 @@ public final class MetalAccelerator implements Accelerator {
 
   private static MemorySegment contents(MemorySegment buffer, long floats) {
     return ObjC.id(buffer, "contents").reinterpret(floats * 4);
+  }
+
+  private final MetalDevice deviceApi = new MetalDevice();
+
+  @Override
+  public io.github.ticofab.demucs.spi.Device device() {
+    return deviceApi;
+  }
+
+  /**
+   * The {@link io.github.ticofab.demucs.spi.Device} API: every operation is encoded into one open command buffer,
+   * which is committed only when a result is downloaded. Objects the queued work refers to (MPS matrices and
+   * kernels, scratch buffers) are released or recycled only after that.
+   */
+  private final class MetalDevice implements io.github.ticofab.demucs.spi.Device {
+
+    private record Buf(MemorySegment buffer, long floats) implements Buffer {}
+
+    private MemorySegment commands = MemorySegment.NULL;
+    private MemorySegment autoreleasePool = MemorySegment.NULL;
+    private final java.util.List<MemorySegment> releaseAfter = new java.util.ArrayList<>();
+    private final java.util.List<MemorySegment> recycleAfter = new java.util.ArrayList<>();
+    private final Map<float[], Buf> constantBufs = new IdentityHashMap<>();
+
+    private MemorySegment open() {
+      if (commands.equals(MemorySegment.NULL)) {
+        autoreleasePool = ObjC.poolPush();
+        commands = ObjC.id(queue, "commandBuffer");
+      }
+      return commands;
+    }
+
+    // Runs on the GPU thread: commits what is queued, waits, then frees what the work referred to.
+    private void flush() {
+      if (commands.equals(MemorySegment.NULL)) return;
+      try {
+        run(commands);
+      } finally {
+        releaseAfter.forEach(ObjC::release);
+        releaseAfter.clear();
+        recycleAfter.forEach(MetalAccelerator.this::recycle);
+        recycleAfter.clear();
+        commands = MemorySegment.NULL;
+        ObjC.poolPop(autoreleasePool);
+      }
+    }
+
+    private MemorySegment seg(Buffer b) {
+      return ((Buf) b).buffer();
+    }
+
+    private MemorySegment later(MemorySegment object) {
+      releaseAfter.add(object);
+      return object;
+    }
+
+    @Override
+    public Buffer upload(float[] data) {
+      return onGpu(() -> new Buf(MetalAccelerator.this.upload(data, 0, data.length), data.length));
+    }
+
+    @Override
+    public Buffer constant(float[] weights) {
+      return onGpu(() -> constantBufs.computeIfAbsent(weights, w -> {
+        MemorySegment b = constants.get(w);
+        if (b == null) throw new IllegalArgumentException("not a constant array");
+        return new Buf(b, w.length);
+      }));
+    }
+
+    @Override
+    public Buffer allocate(long floats) {
+      return onGpu(() -> new Buf(output(floats * 4), floats));
+    }
+
+    @Override
+    public void download(Buffer buffer, float[] dst, int count) {
+      onGpu(() -> {
+        flush();
+        copyOut(contents(seg(buffer), count), 0, dst, 0, count);
+        return null;
+      });
+    }
+
+    @Override
+    public void release(Buffer buffer) {
+      onGpu(() -> {
+        if (constantBufs.containsValue(buffer)) return null;
+        if (commands.equals(MemorySegment.NULL)) recycle(seg(buffer));
+        else recycleAfter.add(seg(buffer));
+        return null;
+      });
+    }
+
+    @Override
+    public void gemm(int m, int n, int k, Buffer a, int lda, Buffer b, int ldb, Buffer c, int ldc, boolean accumulate) {
+      onGpu(() -> {
+        MemorySegment cb = open();
+        MemorySegment ma = later(matrix(seg(a), 0, m, k, lda)), mb = later(matrix(seg(b), 0, k, n, ldb));
+        MemorySegment mc = later(matrix(seg(c), 0, m, n, ldc));
+        MemorySegment op = later((MemorySegment) ObjC.send(ADDRESS, ObjC.id(ObjC.cls("MPSMatrixMultiplication"), "alloc"),
+            "initWithDevice:transposeLeft:transposeRight:resultRows:resultColumns:interiorColumns:alpha:beta:",
+            List.of(ADDRESS, JAVA_BOOLEAN, JAVA_BOOLEAN, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_DOUBLE, JAVA_DOUBLE),
+            device, false, false, (long) m, (long) n, (long) k, 1.0, accumulate ? 1.0 : 0.0));
+        ObjC.send(null, op, "encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:",
+            List.of(ADDRESS, ADDRESS, ADDRESS, ADDRESS), cb, ma, mb, mc);
+        return null;
+      });
+    }
+
+    @Override
+    public void attention(int batch, int length, int heads, int headDim, Buffer q, Buffer k, Buffer v, Buffer out) {
+      onGpu(() -> {
+        MemorySegment cb = open();
+        int inner = heads * headDim;
+        long scoreBytes = (long) batch * length * length * 4;
+        MemorySegment scores = output(scoreBytes);
+        recycleAfter.add(scores);
+        MemorySegment qk = later(multiplication(false, true, length, length, headDim, 1 / Math.sqrt(headDim)));
+        MemorySegment pv = later(multiplication(false, false, length, headDim, length, 1.0));
+        long seqBytes = (long) length * inner * 4, square = (long) length * length * 4;
+        MemorySegment matS = later(batchMatrix(scores, 0, length, length, length * 4L, square, batch));
+        List<java.lang.foreign.MemoryLayout> four = List.of(ADDRESS, ADDRESS, ADDRESS, ADDRESS);
+        for (int h = 0; h < heads; h++) {
+          long off = (long) h * headDim * 4;
+          MemorySegment mq = later(batchMatrix(seg(q), off, length, headDim, inner * 4L, seqBytes, batch));
+          MemorySegment mk = later(batchMatrix(seg(k), off, length, headDim, inner * 4L, seqBytes, batch));
+          MemorySegment mv = later(batchMatrix(seg(v), off, length, headDim, inner * 4L, seqBytes, batch));
+          MemorySegment mo = later(batchMatrix(seg(out), off, length, headDim, inner * 4L, seqBytes, batch));
+          ObjC.send(null, qk, "encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:", four, cb, mq, mk, matS);
+          encodeSoftmax(cb, scores, batch * length, length);
+          ObjC.send(null, pv, "encodeToCommandBuffer:leftMatrix:rightMatrix:resultMatrix:", four, cb, matS, mv, mo);
+        }
+        return null;
+      });
+    }
+
+    @Override
+    public void rmsNorm(Buffer x, Buffer out, int rows, int dim, Buffer gamma) {
+      onGpu(() -> {
+        encodeRows(open(), rmsPipeline, rows, dim, new MemorySegment[] {seg(x), seg(out), seg(gamma)}, new int[] {rows, dim});
+        return null;
+      });
+    }
+
+    @Override
+    public void ropeSplit(Buffer qkv, Buffer q, Buffer k, Buffer v, int sequences, int length, int seqStride,
+                          int posStride, int heads, int headDim, Buffer cos, Buffer sin) {
+      kernel(ropePipeline, sequences * length * heads * headDim, new Buffer[] {qkv, q, k, v, cos, sin},
+          new int[] {sequences, length, seqStride, posStride, heads, headDim});
+    }
+
+    @Override
+    public void gateMerge(Buffer ctx, Buffer gates, Buffer gateBias, Buffer out, int sequences, int length,
+                          int seqStride, int posStride, int heads, int headDim) {
+      kernel(gatePipeline, sequences * length * heads * headDim, new Buffer[] {ctx, gates, gateBias, out},
+          new int[] {sequences, length, seqStride, posStride, heads, headDim});
+    }
+
+    @Override
+    public void addBias(Buffer x, Buffer bias, int rows, int cols, boolean gelu) {
+      kernel(biasPipeline, rows * cols, new Buffer[] {x, bias}, new int[] {rows, cols, gelu ? 1 : 0});
+    }
+
+    private void kernel(MemorySegment pipeline, int threads, Buffer[] buffers, int[] ints) {
+      onGpu(() -> {
+        MemorySegment[] segs = new MemorySegment[buffers.length];
+        for (int i = 0; i < buffers.length; i++) segs[i] = seg(buffers[i]);
+        encodeKernel(open(), pipeline, threads, segs, ints);
+        return null;
+      });
+    }
   }
 }
