@@ -53,7 +53,8 @@ notes size the inference paths we actually run.
 - `notes/` — analysis per component: `htdemucs.md`, `bs-roformer.md`, `jvm-landscape.md` (JVM runtimes, weights,
   DSP, Reactive Streams, yt-dlp).
 - `PLAN.md` — the porting plan, written from the notes.
-- `sources/` — shallow clones of the code we studied (and prior art), for reading; not ours, not in git.
+- `sources/` — not kept: the code we studied, which the notes cite by path and line. Restore it with the commands
+  below.
 
 Build: `mvn install` in `demucs-jvm`, then in `demucs-jvm-metal`; splitter picks both up from the local Maven
 repository. The libraries are not published.
@@ -63,3 +64,34 @@ repository. The libraries are not published.
 Done: both separation models and the crossover run on the JVM, on the Apple GPU or the CPU, matching PyTorch/scipy
 to float rounding; splitter uses them and no longer needs Python. yt-dlp was deliberately not ported (see
 `notes/jvm-landscape.md` and splitter's `HISTORY.md`): splitter fetches its standalone build instead.
+
+## Sources studied
+
+The notes refer to these repositories at these commits:
+
+| Folder | Repository | Commit |
+|--------|------------|--------|
+| `audio-separator` | [nomadkaraoke/python-audio-separator](https://github.com/nomadkaraoke/python-audio-separator) | `4dd3477` (tag v0.48.0) |
+| `demucs` | [adefossez/demucs](https://github.com/adefossez/demucs) | `829d218` |
+| `bs-roformer` | [lucidrains/BS-RoFormer](https://github.com/lucidrains/BS-RoFormer) | `4b95192` |
+| `msst` | [ZFTurbo/Music-Source-Separation-Training](https://github.com/ZFTurbo/Music-Source-Separation-Training) | `1f700c3` |
+| `demucs.cpp` | [sevagh/demucs.cpp](https://github.com/sevagh/demucs.cpp) | `4edae49` |
+| `demucs.onnx` | [sevagh/demucs.onnx](https://github.com/sevagh/demucs.onnx) | `81fa192` |
+| `yt-dlp` | [yt-dlp/yt-dlp](https://github.com/yt-dlp/yt-dlp) | `4adbf69` |
+
+To restore them into `sources/` (ignored by git):
+
+```sh
+mkdir -p sources && cd sources
+while read dir repo commit; do
+  git clone -q "https://github.com/$repo.git" "$dir" && git -C "$dir" checkout -q "$commit"
+done <<'LIST'
+audio-separator nomadkaraoke/python-audio-separator 4dd3477
+demucs adefossez/demucs 829d218
+bs-roformer lucidrains/BS-RoFormer 4b95192
+msst ZFTurbo/Music-Source-Separation-Training 1f700c3
+demucs.cpp sevagh/demucs.cpp 4edae49
+demucs.onnx sevagh/demucs.onnx 81fa192
+yt-dlp yt-dlp/yt-dlp 4adbf69
+LIST
+```
