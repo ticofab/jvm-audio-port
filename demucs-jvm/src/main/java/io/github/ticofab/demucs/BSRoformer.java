@@ -171,6 +171,23 @@ public final class BSRoformer {
     Device.Buffer merged = dev.allocate((long) tokens * inner), hidden = dev.allocate((long) tokens * FF);
     Map<String, Device.Buffer[]> tables = new HashMap<>();
     List<Device.Buffer> scratch = new ArrayList<>(List.of(bx, xn, qkv, gates, q, k, v, ctx, merged, hidden));
+    try {
+      queueTransformers(dev, bx, xn, qkv, gates, q, k, v, ctx, merged, hidden, tables, scratch, frames, bands);
+      dev.download(xn, x, tokens * DIM);
+    } catch (RuntimeException | Error e) {
+      dev.download(xn, new float[0], 0); // submits what was queued, so its scratch can be released
+      throw e;
+    } finally {
+      scratch.forEach(dev::release);
+    }
+  }
+
+  private void queueTransformers(Device dev, Device.Buffer bx, Device.Buffer xn, Device.Buffer qkv,
+                                 Device.Buffer gates, Device.Buffer q, Device.Buffer k, Device.Buffer v,
+                                 Device.Buffer ctx, Device.Buffer merged, Device.Buffer hidden,
+                                 Map<String, Device.Buffer[]> tables, List<Device.Buffer> scratch, int frames,
+                                 int bands) {
+    int tokens = frames * bands, inner = HEADS * HEAD_DIM;
     for (int l = 0; l < layers; l++) {
       for (int axis = 0; axis < 2; axis++) {
         String name = "layers." + l + "." + axis, a = name + ".layers.0.0", ff = name + ".layers.0.1";
@@ -196,8 +213,6 @@ public final class BSRoformer {
       }
     }
     dev.rmsNorm(bx, xn, tokens, DIM, dev.constant(p("final_norm.gamma")));
-    dev.download(xn, x, tokens * DIM);
-    scratch.forEach(dev::release);
   }
 
   // cos and sin of position * freqs[pair], in float32 as torch computes the angles; uploaded as (length, pairs).

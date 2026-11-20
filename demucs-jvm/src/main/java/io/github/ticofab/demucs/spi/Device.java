@@ -7,6 +7,7 @@ package io.github.ticofab.demucs.spi;
  *
  * <p>Operations take effect in order; {@link #download} waits for everything queued before it. Offsets and sizes
  * are in floats; matrices are row-major. Buffers are single-use scratch unless obtained from {@link #constant}.
+ * Finish with a download, also on failure, so that queued work is submitted.
  */
 public interface Device {
 
